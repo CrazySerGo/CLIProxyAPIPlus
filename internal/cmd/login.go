@@ -53,7 +53,8 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 		options = &LoginOptions{}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 
 	promptFn := options.Prompt
 	if promptFn == nil {
@@ -99,6 +100,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 	}
 
 	log.Info("Authentication successful.")
+	fmt.Println("Fetching Google Cloud projects...")
 
 	projects, errProjects := fetchGCPProjects(ctx, httpClient)
 	if errProjects != nil {
@@ -120,7 +122,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 	activatedProjects := make([]string, 0, len(projectSelections))
 	seenProjects := make(map[string]bool)
 	for _, candidateID := range projectSelections {
-		log.Infof("Activating project %s", candidateID)
+		fmt.Printf("Activating project %s...\n", candidateID)
 		if errSetup := performGeminiCLISetup(ctx, httpClient, storage, candidateID); errSetup != nil {
 			var projectErr *projectSelectionRequiredError
 			if errors.As(errSetup, &projectErr) {
@@ -150,6 +152,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	if !storage.Auto && !storage.Checked {
 		for _, pid := range activatedProjects {
+			fmt.Printf("Verifying Cloud AI API status for project %s...\n", pid)
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, pid)
 			if errCheck != nil {
 				log.Errorf("Failed to check if Cloud AI API is enabled for %s: %v", pid, errCheck)
