@@ -80,34 +80,10 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 	}
 	callbackURL := fmt.Sprintf("http://localhost:%d/oauth2callback", callbackPort)
 
-	// Configure proxy settings for the HTTP client if a proxy URL is provided.
-	proxyURL, err := url.Parse(cfg.ProxyURL)
-	if err == nil {
-		var transport *http.Transport
-		if proxyURL.Scheme == "socks5" {
-			// Handle SOCKS5 proxy.
-			username := proxyURL.User.Username()
-			password, _ := proxyURL.User.Password()
-			auth := &proxy.Auth{User: username, Password: password}
-			dialer, errSOCKS5 := proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
-			if errSOCKS5 != nil {
-				log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
-				return nil, fmt.Errorf("create SOCKS5 dialer failed: %w", errSOCKS5)
-			}
-			transport = &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return dialer.Dial(network, addr)
-				},
-			}
-		} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
-			// Handle HTTP/HTTPS proxy.
-			transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-		}
-
-		if transport != nil {
-			proxyClient := &http.Client{Transport: transport}
-			ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyClient)
-		}
+	// Configure proxy settings for the HTTP client.
+	proxyClient := util.SetProxy(&cfg.SDKConfig, &http.Client{})
+	if proxyClient.Transport != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyClient)
 	}
 
 	// Configure the OAuth2 client.
@@ -126,7 +102,7 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 		fmt.Printf("Could not load token from file, starting OAuth flow.\n")
 		token, err = g.getTokenFromWeb(ctx, conf, opts)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get token from web: %w", err)
+			return nil, err
 		}
 		// After getting a new token, create a new token storage object with user info.
 		newTs, errCreateTokenStorage := g.createTokenStorage(ctx, conf, token, ts.ProjectID)
@@ -160,8 +136,14 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 //   - *GeminiTokenStorage: A new token storage object with user information
 //   - error: An error if the token storage creation fails, nil otherwise
 func (g *GeminiAuth) createTokenStorage(ctx context.Context, config *oauth2.Config, token *oauth2.Token, projectID string) (*GeminiTokenStorage, error) {
+	fmt.Println("Fetching user information...")
 	httpClient := config.Client(ctx, token)
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
+
+	// Use a timeout for fetching user info
+	infoCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(infoCtx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
 	if err != nil {
 		return nil, fmt.Errorf("could not get user info: %v", err)
 	}
@@ -336,10 +318,6 @@ waitForCallback:
 		case err := <-errChan:
 			return nil, err
 		case <-manualPromptC:
-			manualPromptC = nil
-			if manualPromptTimer != nil {
-				manualPromptTimer.Stop()
-			}
 			select {
 			case code := <-codeChan:
 				authCode = code
@@ -348,15 +326,21 @@ waitForCallback:
 				return nil, err
 			default:
 			}
-			input, err := opts.Prompt("Paste the Gemini callback URL (or press Enter to keep waiting): ")
-			if err != nil {
-				return nil, err
+
+			input, errPrompt := opts.Prompt("Paste the Gemini callback URL (or press Enter to keep waiting): ")
+			if errPrompt != nil {
+				return nil, errPrompt
 			}
-			parsed, err := misc.ParseOAuthCallback(input)
-			if err != nil {
-				return nil, err
+			parsed, errParse := misc.ParseOAuthCallback(input)
+			if errParse != nil {
+				log.Errorf("Invalid callback URL: %v", errParse)
+				// Reset timer to prompt again after another 15s
+				manualPromptTimer.Reset(15 * time.Second)
+				continue
 			}
 			if parsed == nil {
+				// User pressed Enter without input, reset timer to prompt again later
+				manualPromptTimer.Reset(15 * time.Second)
 				continue
 			}
 			if parsed.Error != "" {
@@ -368,19 +352,25 @@ waitForCallback:
 			authCode = parsed.Code
 			break waitForCallback
 		case <-timeoutTimer.C:
-			return nil, fmt.Errorf("oauth flow timed out")
+			return nil, fmt.Errorf("oauth flow timed out after 5 minutes")
 		}
 	}
 
-	// Shutdown the server.
-	if err := server.Shutdown(ctx); err != nil {
-		log.Errorf("Failed to shut down server: %v", err)
+	// Shutdown the server with a short timeout.
+	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Debugf("Server shutdown warning: %v", err)
 	}
+	shutdownCancel()
 
-	// Exchange the authorization code for a token.
-	token, err := config.Exchange(ctx, authCode)
+	// Exchange the authorization code for a token with timeout.
+	fmt.Println("Exchanging authorization code for token...")
+	exchangeCtx, exchangeCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer exchangeCancel()
+
+	token, err := config.Exchange(exchangeCtx, authCode)
 	if err != nil {
-		return nil, fmt.Errorf("failed to exchange token: %w", err)
+		return nil, fmt.Errorf("failed to exchange token (network issue or expired code): %w", err)
 	}
 
 	fmt.Println("Authentication successful.")
