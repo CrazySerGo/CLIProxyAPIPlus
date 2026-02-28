@@ -682,3 +682,39 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 		},
 	})
 }
+
+// Embeddings handles the /v1/embeddings endpoint.
+func (h *OpenAIAPIHandler) Embeddings(c *gin.Context) {
+	rawJSON, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	modelName := gjson.GetBytes(rawJSON, "model").String()
+	if modelName == "" {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "model is required",
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		cliCancel(errMsg.Error)
+		return
+	}
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	_, _ = c.Writer.Write(resp)
+	cliCancel()
+}
